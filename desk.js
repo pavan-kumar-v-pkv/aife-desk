@@ -3,10 +3,15 @@
  * AIFE Desk: the paper account, research and machines in one installable app.
  * Reads everything from GitHub (the paper-state branch and the repo itself) with the
  * user's own token, kept only on this device. Paper money only: there is no code
- * path from here to a broker. The only write is starting the paper-daily workflow.
+ * path from here to a broker. It writes two things: it starts the paper-daily
+ * workflow, and it records approve/reject decisions on proposals that already
+ * passed the risk gate (data/decisions/<signal day>.json). The daily run applies a
+ * decision only if it was made before the fill session's 09:15 open.
  */
 
-const APP_VERSION = "desk-app-v1";
+const APP_VERSION = "desk-app-v2";
+const DECISIONS_VERSION = "desk-decisions-v1";
+const IST_OFFSET_MIN = 330;
 const DEFAULT_REPO = "pavan-kumar-v-pkv/ai-investment-trading-engine";
 const STATE_BRANCH = "paper-state";
 const WORKFLOW = "paper-daily.yml";
@@ -20,7 +25,8 @@ const saved = {
 };
 
 const ui = { tab: saved.get(KEYS.tab) || "desk", snap: null, loading: false, error: null,
-             sort: { key: "value", dir: -1 }, orderFilter: "planned", runMessage: null };
+             sort: { key: "value", dir: -1 }, orderFilter: "planned", runMessage: null,
+             stock: null, confirm: null, saving: null, decisionMessage: null };
 
 /* ---------- formatting ---------- */
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -57,6 +63,20 @@ function expectedSession() {
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
+
+/* 09:15 IST on the first weekday after the signal day: the fill session's open. A market holiday
+   only moves the real open later, so this deadline is never later than the one the run enforces. */
+function decisionDeadline(signalDay) {
+  const d = new Date(signalDay + "T00:00:00Z");
+  do { d.setUTCDate(d.getUTCDate() + 1); } while (d.getUTCDay() === 0 || d.getUTCDay() === 6);
+  return new Date(d.getTime() + (9 * 60 + 15 - IST_OFFSET_MIN) * 60000);
+}
+function nowIstIso() {
+  const ist = new Date(Date.now() + IST_OFFSET_MIN * 60000).toISOString().slice(0, 19);
+  return ist + "+05:30";
+}
+const b64encode = (text) => { let s = ""; for (const b of new TextEncoder().encode(text)) s += String.fromCharCode(b); return btoa(s); };
+const b64decode = (data) => new TextDecoder().decode(Uint8Array.from(atob(data.replace(/\s/g, "")), (c) => c.charCodeAt(0)));
 
 /* ---------- GitHub ---------- */
 class GitHubError extends Error {
@@ -100,6 +120,20 @@ class GitHub {
   commits() { return this.req(`/repos/${this.repo}/commits?sha=${STATE_BRANCH}&per_page=15`); }
   runs() { return this.req(`/repos/${this.repo}/actions/workflows/${WORKFLOW}/runs?per_page=8`); }
   dispatch() { return this.req(`/repos/${this.repo}/actions/workflows/${WORKFLOW}/dispatches`, { method: "POST", body: { ref: "main" } }); }
+  /* {sha, text} of a file on the state branch, or null when it doesn't exist yet */
+  async fileWithSha(path) {
+    try {
+      const meta = await this.req(`/repos/${this.repo}/contents/${path}?ref=${STATE_BRANCH}`);
+      return { sha: meta.sha, text: b64decode(meta.content) };
+    } catch (err) {
+      if (err instanceof GitHubError && err.status === 404) return null;
+      throw err;
+    }
+  }
+  putFile(path, text, sha, message) {
+    return this.req(`/repos/${this.repo}/contents/${path}`, { method: "PUT",
+      body: { message, content: b64encode(text), branch: STATE_BRANCH, ...(sha ? { sha } : {}) } });
+  }
   check() { return this.req(`/repos/${this.repo}`); }
 }
 
@@ -123,10 +157,12 @@ function parseCloses(csv) {
 
 async function loadSnapshot(gh) {
   const settle = (p) => p.then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
-  const [summary, account, index, statusDir, commits, runs, hyp] = await Promise.all([
+  const [summary, account, index, nifty50, vix, statusDir, commits, runs, hyp] = await Promise.all([
     settle(gh.json("data/paper/summary.json")),
     settle(gh.json("data/paper/account.json")),
     settle(gh.file("data/cache/index/NIFTY_500.csv")),
+    settle(gh.file("data/cache/index/NIFTY_50.csv")),
+    settle(gh.file("data/cache/index/INDIA_VIX.csv")),
     settle(gh.dir("data/status")),
     settle(gh.commits()),
     settle(gh.runs()),
@@ -139,12 +175,18 @@ async function loadSnapshot(gh) {
     const loaded = await Promise.all(files.map((f) => settle(gh.json(f.path))));
     loaded.forEach((r, i) => { if (r.ok) statuses[files[i].name.replace(/\.json$/, "")] = r.value; });
   }
+  const signalDay = summary.value.signal_day;
+  const decisions = signalDay ? await settle(gh.json(`data/decisions/${signalDay}.json`)) : { ok: false };
   return {
     loadedAt: Date.now(),
     repo: gh.repo,
     summary: summary.value,
     account: account.ok ? account.value : null,
     closes: index.ok ? parseCloses(index.value) : {},
+    market: { "NIFTY 50": nifty50.ok ? parseCloses(nifty50.value) : {},
+              "NIFTY 500": index.ok ? parseCloses(index.value) : {},
+              "India VIX": vix.ok ? parseCloses(vix.value) : {} },
+    decisions: decisions.ok ? decisions.value : { version: DECISIONS_VERSION, decisions: {} },
     statuses,
     commits: commits.ok ? commits.value : [],
     runs: runs.ok ? runs.value.workflow_runs || [] : [],
@@ -170,25 +212,100 @@ function recorderStatus(snap) {
   return Object.values(snap.statuses || {}).map((s) => s.project?.recorder).filter((r) => r && r.recorded_days > 0)
     .sort((a, b) => b.sealed_days - a.sealed_days)[0] || null;
 }
+/* closes and the day's move of one stock, from the newest machine report that has it */
+function stockOf(snap, symbol) {
+  const reports = Object.values(snap.statuses || {}).filter((s) => s.stocks?.[symbol])
+    .sort((a, b) => String(b.generated_at).localeCompare(String(a.generated_at)));
+  const info = reports[0]?.stocks?.[symbol];
+  if (!info) return null;
+  const close = N(info.close), prev = N(info.prev_close);
+  return { closes: (info.closes || []).map(([d, c]) => [d, Number(c)]), close, prev,
+           move: close && prev ? close / prev - 1 : null };
+}
+function holdingRows(snap) {
+  const s = snap.summary, equity = N(s.equity);
+  return (s.positions || []).map((p) => {
+    const cost = N(p.cost_basis), value = N(p.value), gain = N(p.gain), qty = N(p.quantity);
+    const info = stockOf(snap, p.symbol);
+    const dayGain = info?.move !== null && info?.move !== undefined && info.prev ? (info.close - info.prev) * qty : null;
+    return { symbol: p.symbol, sector: p.sector || "Unknown sector", qty, avg: cost / qty, price: N(p.price), value, gain,
+             gainPct: gain / cost, weight: value / equity, dayGain, dayPct: info?.move ?? null,
+             rank: p.rank === undefined ? undefined : N(p.rank), entryPrice: N(p.entry_price), peak: N(p.peak_close),
+             held: p.entry_day && s.signal_day ? daysBetween(p.entry_day, s.signal_day) : null, entry: p.entry_day };
+  });
+}
+/* where a holding stands against the sell rule: sold once its rank passes the exit rank */
+function exitStanding(snap, rank) {
+  const exit = N(snap.summary.exit_rank);
+  if (rank === undefined || !exit) return null;     // summary from before ranks were published
+  if (rank === null) return { text: "Not ranked: proposed for sale", kind: "bad", room: 0 };
+  const room = 1 - rank / exit;
+  return { text: `Rank ${rank}, sold past ${exit}`, kind: room < 0.2 ? "warn" : "plain", room };
+}
+const isOpen = (p) => p.status === "APPROVED" || p.status === "AWAITING_USER";
+function decisionOf(snap, id) { return snap.decisions?.decisions?.[id] || null; }
 
 /* ---------- small renderers ---------- */
 const chip = (text, kind = "plain") => `<span class="chip ${kind}">${esc(text)}</span>`;
 const statusChip = (status) => {
-  const kind = { APPROVED: "good", FILLED: "plain", REJECTED_BY_RISK: "bad", REJECTED: "bad", PENDING: "warn" }[status] || "plain";
-  const label = { APPROVED: "Planned", FILLED: "Filled", REJECTED_BY_RISK: "Blocked", REJECTED: "Rejected", PENDING: "Pending" }[status] || status;
+  const kind = { APPROVED: "good", FILLED: "plain", REJECTED_BY_RISK: "bad", REJECTED_BY_AI: "bad", REJECTED_BY_USER: "bad",
+                 AWAITING_USER: "warn", NOT_FILLED: "warn", EXPIRED: "plain" }[status] || "plain";
+  const label = { APPROVED: "Planned", FILLED: "Filled", REJECTED_BY_RISK: "Blocked", REJECTED_BY_AI: "Vetoed by AI",
+                  REJECTED_BY_USER: "Rejected by you", AWAITING_USER: "Needs your OK", NOT_FILLED: "Not filled", EXPIRED: "Expired" }[status] || status;
   return chip(label, kind);
 };
+const symBtn = (symbol) => `<button type="button" class="sym-btn" data-act="stock" data-key="${esc(symbol)}">${esc(symbol)}</button>`;
+
+/* Approve / reject a proposal of the latest signal that passed the risk gate, until the fill session opens. */
+function decisionControls(snap, p) {
+  if (p.signal_day !== snap.summary.signal_day || !isOpen(p)) return "";
+  const deadline = decisionDeadline(p.signal_day);
+  const d = decisionOf(snap, p.proposal_id);
+  const id = esc(p.proposal_id);
+  if (ui.saving === p.proposal_id) return `<div class="decide"><span class="muted">Saving…</span></div>`;
+  if (Date.now() >= deadline.getTime())
+    return d ? `<div class="decide">${chip(d.action === "reject" ? "You rejected it" : "You approved it", d.action === "reject" ? "bad" : "good")}</div>` : "";
+  const by = `before ${deadline.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", weekday: "short", hour: "2-digit", minute: "2-digit" })}`;
+  if (d) return `<div class="decide">${chip(d.action === "reject" ? "You rejected it" : "You approved it", d.action === "reject" ? "bad" : "good")}
+      <span class="muted">applies at the next run</span><button class="btn small" type="button" data-act="decide" data-key="${id}" data-action="undo">Undo</button></div>`;
+  if (ui.confirm === p.proposal_id)
+    return `<div class="decide"><span>Reject ${esc(p.side === "BUY" ? "this buy" : "this sale")}?</span>
+      <button class="btn small danger" type="button" data-act="decide" data-key="${id}" data-action="reject">Yes, reject</button>
+      <button class="btn small" type="button" data-act="decide" data-key="${id}" data-action="cancel">Keep</button></div>`;
+  return `<div class="decide">${p.status === "AWAITING_USER" ? `<button class="btn small primary" type="button" data-act="decide" data-key="${id}" data-action="approve">Approve</button>` : ""}
+    <button class="btn small" type="button" data-act="decide" data-key="${id}" data-action="ask-reject">Reject</button>
+    <span class="muted">${esc(by)}</span></div>`;
+}
+
+function marketStrip(snap) {
+  const cells = Object.entries(snap.market || {}).map(([name, closes]) => {
+    const days = Object.keys(closes).sort();
+    if (!days.length) return `<div class="mkt"><div class="label">${esc(name)}</div><div class="value num muted">–</div><div class="sub">after the next run</div></div>`;
+    const last = closes[days[days.length - 1]], prev = days.length > 1 ? closes[days[days.length - 2]] : null;
+    const ch = prev ? last / prev - 1 : null;
+    const vix = name === "India VIX";
+    return `<div class="mkt"><div class="label">${esc(name)}</div>
+      <div class="value num">${inr2.format(last)}</div>
+      <div class="sub" title="close of ${esc(day(days[days.length - 1]))}"><span class="num ${vix ? "" : tone(ch)}">${prev ? `${sign(last - prev)}${inr2.format(Math.abs(last - prev))} (${pct(ch)})` : "–"}</span></div></div>`;
+  }).join("");
+  const breadth = N(snap.summary.breadth);
+  return `<div class="market" aria-label="Market at the last close">${cells}
+    <div class="mkt"><div class="label">Breadth</div><div class="value num">${pctPlain(breadth)}</div>
+      <div class="sub">${snap.summary.gate_open ? `<span class="up">buys allowed</span>` : `<span class="down">buys blocked</span>`}</div></div></div>`;
+}
 const verdictChip = (status) => chip(status, { "NO SIGNAL": "bad", "NOT SUPPORTED": "bad", "INSUFFICIENT DATA": "warn", SIGNAL: "good", SUPPORTED: "good" }[status] || "plain");
 const bar = (fraction, cls = "") => `<div class="bar ${cls}"><span style="width:${Math.max(0, Math.min(1, fraction || 0)) * 100}%"></span></div>`;
 const panel = (title, body, aside = "") => `<div class="panel"><h2><span>${esc(title)}</span>${aside ? `<span class="aside">${aside}</span>` : ""}</h2>${body}</div>`;
 const kpi = (label, value, sub = "", cls = "", valueCls = "") =>
   `<div class="kpi ${cls}"><div class="label">${esc(label)}</div><div class="value ${valueCls}">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ""}</div>`;
 
-function lineChart(series, { height = 220 } = {}) {
+function lineChart(series, { height = 220, fmt = (v) => v.toFixed(1), label = "Account value against the NIFTY 500, both starting at 100",
+                             empty = "The chart starts once the account has two sessions.", ref = null } = {}) {
   const pts = series.flatMap((s) => s.points);
-  if (pts.length < 2) return `<div class="empty">The chart starts once the account has two sessions.</div>`;
+  if (ref) pts.push([pts[0]?.[0], ref.value]);
+  if (pts.length < 2) return `<div class="empty">${esc(empty)}</div>`;
   const W = 640, H = height, L = 46, R = 14, T = 12, B = 26;
-  const dates = [...new Set(pts.map((p) => p[0]))].sort();
+  const dates = [...new Set(series.flatMap((s) => s.points).map((p) => p[0]))].sort();
   const xi = Object.fromEntries(dates.map((d, i) => [d, i]));
   let lo = Math.min(...pts.map((p) => p[1])), hi = Math.max(...pts.map((p) => p[1]));
   const padY = Math.max((hi - lo) * 0.15, 0.25);
@@ -199,8 +316,10 @@ function lineChart(series, { height = 220 } = {}) {
   for (let i = 0; i <= ticks; i++) {
     const v = lo + ((hi - lo) * i) / ticks;
     grid.push(`<line class="grid-line" x1="${L}" x2="${W - R}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"/>` +
-      `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${v.toFixed(1)}</text>`);
+      `<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmt(v))}</text>`);
   }
+  if (ref) grid.push(`<line class="ref-line" x1="${L}" x2="${W - R}" y1="${y(ref.value).toFixed(1)}" y2="${y(ref.value).toFixed(1)}"/>` +
+    `<text x="${L + 6}" y="${(y(ref.value) - 5).toFixed(1)}">${esc(ref.label)}</text>`);
   const lines = series.map((s) => {
     if (s.points.length < 1) return "";
     const path = s.points.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join(" ");
@@ -210,7 +329,7 @@ function lineChart(series, { height = 220 } = {}) {
       `<circle cx="${x(last[0]).toFixed(1)}" cy="${y(last[1]).toFixed(1)}" r="3.5" fill="${s.color}"/>`;
   }).join("");
   const xl = `<text x="${L}" y="${H - 6}">${esc(dayShort(dates[0]))}</text><text x="${W - R}" y="${H - 6}" text-anchor="end">${esc(dayShort(dates[dates.length - 1]))}</text>`;
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Account value against the NIFTY 500, both starting at 100">${grid.join("")}${lines}${xl}</svg>`;
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">${grid.join("")}${lines}${xl}</svg>`;
 }
 
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#888"; }
@@ -259,22 +378,28 @@ function viewDesk(snap) {
   const sessions = card ? card.sessions : curve.length;
   const reading = card?.reading || "TOO EARLY";
   const readingChip = chip(reading === "TOO EARLY" ? `Too early: ${sessions} of 60 sessions` : reading, reading === "AHEAD" ? "good" : reading === "BEHIND" ? "bad" : "warn");
-  const chart = panel("Account vs NIFTY 500", `${lineChart(series)}
+  const chart = panel("Account vs NIFTY 500", `${lineChart(series, { fmt: (v) => pct((v - 100) / 100, 1) })}
     <div class="inline" style="justify-content:space-between;margin-top:8px">
       <div class="legend">${series.map((x) => `<span><i style="background:${x.color}"></i>${esc(x.name)}</span>`).join("")}</div>
       ${readingChip}
     </div>
-    <div class="big-note" style="margin-top:8px">Both lines start at 100. A reading of ahead or behind counts only after 60 sessions, so a lucky week can't be over-read.</div>`,
+    <div class="big-note" style="margin-top:8px">Change since the account's first session. A reading of ahead or behind counts only after 60 sessions, so a lucky week can't be over-read.</div>`,
     card ? `difference <span class="num ${tone(N(card.excess_return))}">${pct(N(card.excess_return))}</span>` : "");
 
-  const planned = proposals(snap).filter((p) => p.signal_day === s.signal_day && p.status === "APPROVED");
-  const orders = panel(`Next session's orders`, planned.length ? `<div class="rows">${planned.map((p) => `
-      <div class="row"><div>${chip(p.side, p.side === "BUY" ? "good" : "bad")}</div>
-        <div class="grow"><div class="title">${esc(p.symbol)}</div><div class="detail">${esc(p.reason)}</div></div>
+  const planned = proposals(snap).filter((p) => p.signal_day === s.signal_day && isOpen(p))
+    .sort((a, b) => (a.side === b.side ? (a.rank ?? 999) - (b.rank ?? 999) : a.side === "SELL" ? -1 : 1));
+  const waiting = planned.filter((p) => p.status === "AWAITING_USER" && !decisionOf(snap, p.proposal_id)).length;
+  const orders = panel(`Next session's orders`, planned.length ? `<div class="rows">${planned.map(orderRow).join("")}</div>
+      <div class="big-note" style="margin-top:6px">Filled at the next session's open. Reject one before 09:15 that day and the run skips it. Planned on ${esc(day(s.signal_day))}.</div>
+      ${ui.decisionMessage ? `<div class="alert warn" style="margin-top:8px">${esc(ui.decisionMessage)}</div>` : ""}`
+    : `<div class="empty">No orders planned for the next session.</div>`, waiting ? `<span class="chip warn">${waiting} need your OK</span>` : `${planned.length} planned`);
+  function orderRow(p) {
+    return `<div class="row wrap"><div>${chip(p.side, p.side === "BUY" ? "good" : "bad")}</div>
+        <div class="grow"><div class="title">${symBtn(p.symbol)}</div><div class="detail">${esc(p.reason)}</div></div>
         <div class="right num">${esc(p.quantity)} × ${rs2(N(p.reference_price))}<div class="detail">${rs(N(p.quantity) * N(p.reference_price))}</div></div>
-      </div>`).join("")}</div>
-      <div class="big-note" style="margin-top:6px">Filled at the next session's open. Planned on ${esc(day(s.signal_day))}.</div>`
-    : `<div class="empty">No orders planned for the next session.</div>`, `${planned.length} planned`);
+        ${decisionControls(snap, p)}
+      </div>`;
+  }
 
   const sv = s.surveillance || {};
   const market = panel("Market and strategy", `<div class="rows">
@@ -288,7 +413,7 @@ function viewDesk(snap) {
         <div class="right">${chip("Paper only", "warn")}</div></div>
     </div>`);
 
-  return `${alerts.length ? `<div class="stack">${alerts.join("")}</div>` : ""}${kpis}
+  return `${marketStrip(snap)}${alerts.length ? `<div class="stack">${alerts.join("")}</div>` : ""}${kpis}
     <div class="grid">${chart}${orders}</div><div class="grid">${market}${journalSummary(snap)}</div>`;
 }
 
@@ -305,28 +430,44 @@ function journalSummary(snap) {
 
 function viewBook(snap) {
   const s = snap.summary, equity = N(s.equity);
-  const rows = (s.positions || []).map((p) => {
-    const cost = N(p.cost_basis), value = N(p.value), gain = N(p.gain);
-    return { symbol: p.symbol, sector: p.sector || "Unknown sector", qty: N(p.quantity), avg: cost / N(p.quantity),
-             price: N(p.price), value, gain, gainPct: gain / cost, weight: value / equity,
-             held: p.entry_day && s.signal_day ? daysBetween(p.entry_day, s.signal_day) : null, entry: p.entry_day };
-  });
+  const rows = holdingRows(snap);
   const { key, dir } = ui.sort;
-  rows.sort((a, b) => (typeof a[key] === "string" ? a[key].localeCompare(b[key]) : (a[key] ?? 0) - (b[key] ?? 0)) * dir);
-  const tot = rows.reduce((t, r) => ({ value: t.value + r.value, gain: t.gain + r.gain, cost: t.cost + r.value - r.gain }), { value: 0, gain: 0, cost: 0 });
+  rows.sort((a, b) => (typeof a[key] === "string" ? a[key].localeCompare(b[key]) : (a[key] ?? -Infinity) - (b[key] ?? -Infinity)) * dir);
+  const tot = rows.reduce((t, r) => ({ value: t.value + r.value, gain: t.gain + r.gain, cost: t.cost + r.value - r.gain,
+                                       day: r.dayGain === null || t.day === null ? null : t.day + r.dayGain }), { value: 0, gain: 0, cost: 0, day: 0 });
+  const dayTot = rows.length ? tot.day : null;
+  const exitCell = (r) => { const x = exitStanding(snap, r.rank); return x ? chip(x.text, x.kind) : "–"; };
   const col = (k, label, cls = "") => `<th class="${cls}" data-act="sort" data-key="${k}" aria-sort="${key === k ? (dir > 0 ? "ascending" : "descending") : "none"}">${esc(label)}${key === k ? (dir > 0 ? " ↑" : " ↓") : ""}</th>`;
-  const table = rows.length ? `<div class="tablewrap"><table>
-      <thead><tr>${col("symbol", "Stock", "text")}${col("qty", "Qty")}${col("avg", "Avg cost")}${col("price", "Last")}${col("value", "Value")}${col("gain", "P&L")}${col("gainPct", "P&L %")}${col("weight", "Weight")}${col("held", "Held")}</tr></thead>
+  const table = `<div class="tablewrap wide-only"><table>
+      <thead><tr>${col("symbol", "Stock", "text")}${col("qty", "Qty")}${col("avg", "Avg cost")}${col("price", "Last")}${col("dayPct", "Today")}${col("value", "Value")}${col("gain", "P&L")}${col("gainPct", "P&L %")}${col("weight", "Weight")}${col("held", "Held")}${col("rank", "Exit rule", "text")}</tr></thead>
       <tbody>${rows.map((r) => `<tr>
-        <td><span class="sym">${esc(r.symbol)}</span><span class="sec">${esc(r.sector)}</span></td>
+        <td>${symBtn(r.symbol)}<span class="sec">${esc(r.sector)}</span></td>
         <td class="num">${esc(r.qty)}</td><td class="num">${rs2(r.avg)}</td><td class="num">${rs2(r.price)}</td>
+        <td class="num ${tone(r.dayPct)}">${pct(r.dayPct)}<span class="sec">${rsSigned(r.dayGain)}</span></td>
         <td class="num">${rs(r.value)}</td><td class="num ${tone(r.gain)}">${rsSigned(r.gain)}</td>
         <td class="num ${tone(r.gainPct)}">${pct(r.gainPct)}</td><td class="num">${pctPlain(r.weight)}</td>
-        <td class="num" title="since ${esc(day(r.entry))}">${r.held === null ? "–" : esc(r.held) + "d"}</td></tr>`).join("")}</tbody>
-      <tfoot><tr><td>${rows.length} holdings</td><td></td><td></td><td></td><td class="num">${rs(tot.value)}</td>
+        <td class="num" title="since ${esc(day(r.entry))}">${r.held === null ? "–" : r.held === 0 ? "new" : esc(r.held) + "d"}</td><td class="text">${exitCell(r)}</td></tr>`).join("")}</tbody>
+      <tfoot><tr><td>${rows.length} holdings</td><td></td><td></td><td></td><td class="num ${tone(dayTot)}">${rsSigned(dayTot)}</td><td class="num">${rs(tot.value)}</td>
         <td class="num ${tone(tot.gain)}">${rsSigned(tot.gain)}</td><td class="num ${tone(tot.gain)}">${pct(tot.gain / tot.cost)}</td>
-        <td class="num">${pctPlain(tot.value / equity)}</td><td></td></tr></tfoot></table></div>`
-    : `<div class="empty">No holdings. The account is all cash.</div>`;
+        <td class="num">${pctPlain(tot.value / equity)}</td><td></td><td></td></tr></tfoot></table></div>`;
+  // phone: one card per holding, P&L always in view; sorted the same way
+  const sortChoices = [["value", "Value"], ["gain", "P&L"], ["gainPct", "P&L %"], ["dayPct", "Today"], ["rank", "Rank"]];
+  const cards = `<div class="narrow-only stack">
+      <div class="hold-sum"><div><div class="label">Value</div><div class="num">${rs(tot.value)}</div></div>
+        <div><div class="label">P&L</div><div class="num ${tone(tot.gain)}">${rsSigned(tot.gain)} <small>${pct(tot.gain / tot.cost)}</small></div></div>
+        <div><div class="label">Today</div><div class="num ${tone(dayTot)}">${rsSigned(dayTot)}</div></div></div>
+      <div class="seg" role="group" aria-label="Sort holdings">${sortChoices.map(([k, l]) =>
+        `<button type="button" data-act="sort" data-key="${k}" aria-pressed="${key === k}">${l}${key === k ? (dir > 0 ? " ↑" : " ↓") : ""}</button>`).join("")}</div>
+      <div class="rows">${rows.map((r) => { const x = exitStanding(snap, r.rank); return `
+        <div class="hold" data-act="stock" data-key="${esc(r.symbol)}" role="button" tabindex="0">
+          <div class="hold-top"><span class="sym">${esc(r.symbol)}</span><span class="num ${tone(r.gain)}">${rsSigned(r.gain)}</span></div>
+          <div class="hold-mid"><span class="muted">${esc(r.qty)} × ${rs2(r.price)} · ${pctPlain(r.weight)}</span><span class="num ${tone(r.gainPct)}">${pct(r.gainPct)}</span></div>
+          <div class="hold-low"><span class="num ${tone(r.dayPct)}">Today ${pct(r.dayPct)}</span><span class="muted">${r.held === null ? "" : r.held === 0 ? "bought this session" : esc(r.held) + "d held"}</span>${x ? chip(x.text, x.kind) : ""}</div>
+        </div>`; }).join("")}</div></div>`;
+  const holdings = rows.length ? table + cards : `<div class="empty">No holdings. The account is all cash.</div>`;
+  const exitNote = N(s.exit_rank)
+    ? `<div class="big-note" style="margin-top:8px">Exit rule: a holding is sold at the next open once its momentum rank falls past ${esc(s.exit_rank)} of ${esc(s.ranked_count)}${s.stops?.stop_loss_pct || s.stops?.trailing_stop_pct ? "" : ". There is no price stop-loss in this strategy"}. Tap a stock for its chart.</div>`
+    : `<div class="big-note" style="margin-top:8px">Ranks and the exit rule appear after the next daily run. Tap a stock for its chart.</div>`;
 
   const exposure = Object.entries(s.sector_exposure || {}).map(([k, v]) => [k, N(v)]).sort((a, b) => b[1] - a[1]);
   const cashShare = N(s.cash) / equity;
@@ -343,12 +484,12 @@ function viewBook(snap) {
       <div class="row"><div class="grow"><div class="title">Invested</div></div><div class="right num">${pctPlain(1 - cashShare)}</div></div>
       <div class="row"><div class="grow"><div class="title">Unrealised P&L</div></div><div class="right num ${tone(tot.gain)}">${rsSigned(tot.gain)}</div></div>
     </div>`);
-  return `${panel("Holdings", table, `prices as of ${esc(day(s.signal_day))} close`)}<div class="grid">${risk}${conc}</div>`;
+  return `${panel("Holdings", holdings + exitNote, `prices as of ${esc(day(s.signal_day))} close`)}<div class="grid">${risk}${conc}</div>`;
 }
 
 function viewOrders(snap) {
   const all = proposals(snap).sort((a, b) => b.signal_day.localeCompare(a.signal_day) || (a.rank ?? 999) - (b.rank ?? 999));
-  const filters = { planned: (p) => p.status === "APPROVED", blocked: (p) => p.status.startsWith("REJECTED"),
+  const filters = { planned: isOpen, blocked: (p) => p.status.startsWith("REJECTED"),
                     filled: (p) => p.status === "FILLED", all: () => true };
   const counts = Object.fromEntries(Object.entries(filters).map(([k, f]) => [k, all.filter(f).length]));
   const labels = { planned: "Planned", blocked: "Blocked", filled: "Filled", all: "All" };
@@ -361,16 +502,18 @@ function viewOrders(snap) {
     ${ps.map((p) => {
       const ref = N(p.reference_price), fill = N(p.fill_price);
       const slip = fill && ref ? (fill - ref) / ref : null;
+      const controls = decisionControls(snap, p);
       const right = p.status === "FILLED"
         ? `${esc(p.quantity)} @ ${rs2(fill)}<div class="detail">${dayShort(p.fill_day)} · vs signal ${slip === null ? "–" : `<span class="${p.side === "BUY" ? tone(-slip) : tone(slip)}">${pct(slip)}</span>`}${p.realised_gain ? ` · P&L <span class="${tone(N(p.realised_gain))}">${rsSigned(N(p.realised_gain))}</span>` : ""}</div>`
         : `${N(p.quantity) ? esc(p.quantity) + " × " : ""}${rs2(ref)}`;
-      return `<div class="row"><div>${chip(p.side, p.side === "BUY" ? "good" : "bad")}</div>
-        <div class="grow"><div class="title">${esc(p.symbol)} ${statusChip(p.status)}</div>
+      return `<div class="row wrap"><div>${chip(p.side, p.side === "BUY" ? "good" : "bad")}</div>
+        <div class="grow"><div class="title">${symBtn(p.symbol)} ${statusChip(p.status)}</div>
           <div class="detail">${esc(p.reason)}${p.status_reason && p.status_reason !== "within every limit" ? ` · <b>${esc(p.status_reason)}</b>` : ""}</div></div>
-        <div class="right num">${right}</div></div>`;
+        <div class="right num">${right}</div>${controls}</div>`;
     }).join("")}</div></div>`).join("");
   const empty = `<div class="panel"><div class="empty">${{ planned: "Nothing planned for the next session.", blocked: "No orders blocked by the risk gate.", filled: "No fills yet.", all: "No orders yet." }[ui.orderFilter]}</div></div>`;
-  return `<div class="inline" style="justify-content:space-between">${seg}<span class="muted" style="font-size:12.5px">Blocked = stopped by the risk gate, with the reason.</span></div>${groups || empty}`;
+  return `<div class="inline" style="justify-content:space-between">${seg}<span class="muted" style="font-size:12.5px">Blocked = stopped by the risk gate, the AI reviewer or you, with the reason.</span></div>
+    ${ui.decisionMessage ? `<div class="alert warn">${esc(ui.decisionMessage)}</div>` : ""}${groups || empty}`;
 }
 
 function viewResearch(snap) {
@@ -380,7 +523,7 @@ function viewResearch(snap) {
   const top = (s.top_ranked || []).map((t, i) => {
     const p = latest[t.symbol];
     const state = held.has(t.symbol) ? chip("Held", "plain") : p ? statusChip(p.status) : "";
-    return `<tr><td class="num">${i + 1}</td><td class="text"><span class="sym">${esc(t.symbol)}</span>${p?.status_reason && p.status.startsWith("REJECTED") ? `<span class="sec">${esc(p.status_reason)}</span>` : ""}</td>
+    return `<tr><td class="num">${i + 1}</td><td class="text">${symBtn(t.symbol)}${p?.status_reason && p.status.startsWith("REJECTED") ? `<span class="sec">${esc(p.status_reason)}</span>` : ""}</td>
       <td class="num up">${pct(N(t.score), 0)}</td><td class="num">${rs2(N(t.close))}</td><td>${state}</td></tr>`;
   }).join("");
   const signals = panel("Strongest momentum today", top
@@ -462,6 +605,92 @@ function viewSystem(snap) {
   return `<div class="grid">${runPanel}${history}</div><div class="grid">${machines}</div>${settings}`;
 }
 
+/* One stock: price chart, returns, the position, and the latest proposal with its decision. */
+function stockSheet(snap, symbol) {
+  const info = stockOf(snap, symbol);
+  const holding = holdingRows(snap).find((r) => r.symbol === symbol);
+  const props = proposals(snap).filter((p) => p.symbol === symbol)
+    .sort((a, b) => b.signal_day.localeCompare(a.signal_day));
+  const latest = props.find((p) => p.signal_day === snap.summary.signal_day);
+  const ranked = (snap.summary.top_ranked || []).findIndex((t) => t.symbol === symbol);
+  const closes = info?.closes || [];
+  const ret = (n) => (closes.length > n ? closes[closes.length - 1][1] / closes[closes.length - 1 - n][1] - 1 : null);
+  const hi = closes.length ? Math.max(...closes.map((c) => c[1])) : null;
+  const lo = closes.length ? Math.min(...closes.map((c) => c[1])) : null;
+  const last = info?.close ?? holding?.price ?? N(latest?.reference_price);
+  const entryRef = holding?.entryPrice ? { value: holding.entryPrice, label: `bought ${inr2.format(holding.entryPrice)}` } : null;
+  const chart = closes.length > 1
+    ? lineChart([{ name: symbol, color: cssVar("--accent"), area: true, points: closes }],
+        { height: 200, fmt: (v) => inr0.format(v), label: `${symbol} closing prices`, ref: entryRef })
+    : `<div class="empty">The price chart appears after the next daily run publishes a machine report.</div>`;
+  const stat = (label, value, cls = "") => `<div><div class="label">${esc(label)}</div><div class="num ${cls}">${value}</div></div>`;
+  const x = holding ? exitStanding(snap, holding.rank) : null;
+  const position = holding ? `<div class="section-h">Your position</div><div class="rows">
+      <div class="row"><div class="grow">Quantity × average cost</div><div class="right num">${esc(holding.qty)} × ${rs2(holding.avg)}</div></div>
+      <div class="row"><div class="grow">Bought</div><div class="right num">${esc(day(holding.entry))}${holding.entryPrice ? ` at ${rs2(holding.entryPrice)}` : ""}</div></div>
+      <div class="row"><div class="grow">P&L</div><div class="right num ${tone(holding.gain)}">${rsSigned(holding.gain)} (${pct(holding.gainPct)})</div></div>
+      <div class="row"><div class="grow">Today</div><div class="right num ${tone(holding.dayGain)}">${rsSigned(holding.dayGain)}</div></div>
+      <div class="row"><div class="grow">Weight</div><div class="right num">${pctPlain(holding.weight)}</div></div>
+      ${holding.peak ? `<div class="row"><div class="grow">Highest close since buying</div><div class="right num">${rs2(holding.peak)}</div></div>` : ""}
+      <div class="row"><div class="grow">Exit rule</div><div class="right">${x ? chip(x.text, x.kind) : "–"}</div></div>
+    </div>` : "";
+  const order = latest ? `<div class="section-h">Latest signal, ${esc(dayShort(latest.signal_day))}</div><div class="rows">
+      <div class="row wrap"><div>${chip(latest.side, latest.side === "BUY" ? "good" : "bad")}</div>
+        <div class="grow"><div class="title">${N(latest.quantity) ? esc(latest.quantity) + " × " : ""}${rs2(N(latest.reference_price))} ${statusChip(latest.status)}</div>
+          <div class="detail">${esc(latest.reason)}${latest.status_reason && latest.status_reason !== "within every limit" ? ` · ${esc(latest.status_reason)}` : ""}</div></div>
+        ${decisionControls(snap, latest)}</div></div>
+      ${ui.decisionMessage ? `<div class="alert warn">${esc(ui.decisionMessage)}</div>` : ""}` : "";
+  const history = props.filter((p) => p !== latest).slice(0, 6);
+  const past = history.length ? `<div class="section-h">Earlier orders</div><div class="rows">${history.map((p) =>
+      `<div class="row"><div>${chip(p.side, p.side === "BUY" ? "good" : "bad")}</div><div class="grow"><div class="detail">${esc(day(p.signal_day))} · ${esc(p.reason)}</div></div><div class="right">${statusChip(p.status)}</div></div>`).join("")}</div>` : "";
+  return `<div class="sheet-backdrop" data-act="close-stock">
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <div class="sheet-head"><div><div class="sheet-title" id="sheet-title">${esc(symbol)}</div>
+          <div class="muted" style="font-size:12.5px">${esc(holding?.sector || "")}${holding?.sector && ranked >= 0 ? " · " : ""}${ranked >= 0 ? `momentum rank ${ranked + 1} today` : ""}</div></div>
+        <div class="right"><div class="num sheet-price">${rs2(last)}</div><div class="num ${tone(info?.move)}" style="font-size:13px">${info?.prev ? `${sign(info.close - info.prev)}${inr2.format(Math.abs(info.close - info.prev))} (${pct(info.move)})` : ""}</div></div>
+        <button class="icon-btn" type="button" data-act="close-stock" aria-label="Close">✕</button></div>
+      ${chart}
+      <div class="stats">${stat("1 month", pct(ret(21), 1), tone(ret(21)))}${stat("3 months", pct(ret(63), 1), tone(ret(63)))}${stat("6 months", pct(ret(closes.length - 1), 1), tone(ret(closes.length - 1)))}
+        ${stat("6-month high", hi ? inr2.format(hi) : "–")}${stat("6-month low", lo ? inr2.format(lo) : "–")}${stat("From high", hi && last ? pct(last / hi - 1, 1) : "–", hi && last < hi ? "down" : "")}</div>
+      <div class="big-note">NSE closing prices, adjusted for splits and bonuses from the corporate-action records.</div>
+      ${order}${position}${past}
+    </div></div>`;
+}
+
+async function saveDecision(proposalId, action) {
+  const snap = ui.snap, signalDay = snap?.summary?.signal_day;
+  const p = proposals(snap).find((x) => x.proposal_id === proposalId);
+  if (!p || p.signal_day !== signalDay || !isOpen(p)) return;
+  if (Date.now() >= decisionDeadline(signalDay).getTime()) { ui.decisionMessage = "Too late: decisions for this signal closed at 09:15 on the fill day."; render(); return; }
+  const gh = new GitHub(saved.get(KEYS.repo) || DEFAULT_REPO, saved.get(KEYS.token));
+  const path = `data/decisions/${signalDay}.json`;
+  ui.saving = proposalId; ui.confirm = null; ui.decisionMessage = null; render();
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const current = await gh.fileWithSha(path);
+      const doc = current ? JSON.parse(current.text) : { version: DECISIONS_VERSION, decisions: {} };
+      if (action === "undo") delete doc.decisions[proposalId];
+      else doc.decisions[proposalId] = { action, decided_at: nowIstIso() };
+      try {
+        await gh.putFile(path, JSON.stringify(doc, null, 1) + "\n", current?.sha,
+          `desk: ${action} ${proposalId}`);
+        snap.decisions = doc;
+        saved.set(KEYS.snapshot, JSON.stringify(snap));
+        break;
+      } catch (err) {   // someone else changed the file in between: read it again once
+        if (attempt === 0 && err instanceof GitHubError && (err.status === 409 || err.status === 422)) continue;
+        throw err;
+      }
+    }
+  } catch (err) {
+    ui.decisionMessage = err instanceof GitHubError && (err.status === 403 || err.status === 404)
+      ? "The token can't save decisions. On GitHub, edit the token and set Contents to Read and write."
+      : explain(err, "Saving the decision");
+  } finally {
+    ui.saving = null; render();
+  }
+}
+
 function viewSetup(message = "") {
   const repo = saved.get(KEYS.repo) || DEFAULT_REPO;
   return `<form class="setup panel" id="setup-form" autocomplete="off">
@@ -470,12 +699,12 @@ function viewSetup(message = "") {
     <ol>
       <li>On GitHub open Settings, Developer settings, Fine-grained tokens, Generate new token.</li>
       <li>Repository access: only <b>ai-investment-trading-engine</b>.</li>
-      <li>Permissions: <b>Contents: Read-only</b> and <b>Actions: Read and write</b> (the second one is for the Run button).</li>
+      <li>Permissions: <b>Contents: Read and write</b> (to approve or reject orders) and <b>Actions: Read and write</b> (for the Run button). Read-only works for viewing.</li>
       <li>Copy the token and paste it below.</li>
     </ol>
     <div class="field"><label for="repo">Repository</label><input id="repo" name="repo" value="${esc(repo)}" spellcheck="false" autocapitalize="off"></div>
     <div class="field"><label for="token">Token</label><input id="token" name="token" type="password" placeholder="github_pat_..." spellcheck="false" autocapitalize="off" required>
-      <div class="hint">Your existing token works for reading. Add Actions: Read and write to it to use the Run button.</div></div>
+      <div class="hint">Your existing token (Contents: Read and write) works for viewing and decisions. Add Actions: Read and write to it to use the Run button.</div></div>
     ${message ? `<div class="alert bad">${esc(message)}</div>` : ""}
     <div><button class="btn primary" type="submit" id="connect-btn">Connect</button></div>
   </form>`;
@@ -512,7 +741,13 @@ function render() {
   $("meta").textContent = snap ? `Session ${dayShort(snap.summary.signal_day)} · updated ${ago(snap.loadedAt)}` : "";
   $("banner").innerHTML = ui.error ? `<div class="alert ${snap ? "warn" : "bad"}">${esc(ui.error)}${snap ? ` Showing data from ${esc(new Date(snap.loadedAt).toLocaleString("en-IN"))}.` : ""}</div>` : "";
   $("view").innerHTML = snap ? VIEWS[ui.tab](snap) : `<div class="panel"><div class="empty">${ui.loading ? "Loading the account from GitHub…" : "Nothing loaded yet."}</div></div>`;
+  const hadSheet = !!$("sheet").innerHTML;
+  $("sheet").innerHTML = snap && ui.stock ? stockSheet(snap, ui.stock) : "";
+  document.body.classList.toggle("sheet-open", !!(snap && ui.stock));
+  if (!hadSheet && ui.stock) $("sheet").querySelector(".sheet [data-act=close-stock]")?.focus();
 }
+function openStock(symbol) { ui.stock = symbol; ui.confirm = null; ui.decisionMessage = null; render(); }
+function closeStock() { ui.stock = null; ui.confirm = null; render(); }
 
 async function refresh() {
   const token = saved.get(KEYS.token);
@@ -563,7 +798,16 @@ document.addEventListener("click", (e) => {
   const t = e.target.closest("[data-act]");
   if (!t) return;
   const act = t.dataset.act, key = t.dataset.key;
-  if (act === "tab") { ui.tab = key; saved.set(KEYS.tab, key); render(); window.scrollTo(0, 0); }
+  if (act === "close-stock") { if (e.target === t || t.tagName === "BUTTON") closeStock(); return; }
+  if (act === "stock") { openStock(key); return; }
+  if (act === "decide") {
+    const action = t.dataset.action;
+    if (action === "ask-reject") { ui.confirm = key; render(); }
+    else if (action === "cancel") { ui.confirm = null; render(); }
+    else saveDecision(key, action);
+    return;
+  }
+  if (act === "tab") { ui.tab = key; ui.stock = null; ui.decisionMessage = null; saved.set(KEYS.tab, key); render(); window.scrollTo(0, 0); }
   else if (act === "sort") { ui.sort = { key, dir: ui.sort.key === key ? -ui.sort.dir : (key === "symbol" ? 1 : -1) }; render(); }
   else if (act === "filter") { ui.orderFilter = key; render(); }
   else if (act === "run") startRun();
@@ -574,6 +818,10 @@ document.addEventListener("click", (e) => {
 });
 document.addEventListener("submit", (e) => {
   if (e.target.id === "setup-form") { e.preventDefault(); connect(e.target); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && ui.stock) closeStock();
+  else if ((e.key === "Enter" || e.key === " ") && e.target.matches?.(".hold[data-act=stock]")) { e.preventDefault(); openStock(e.target.dataset.key); }
 });
 $("refresh").addEventListener("click", refresh);
 document.addEventListener("visibilitychange", () => {

@@ -1,6 +1,6 @@
 // Offline shell for AIFE Desk. Caches the app's own files only; GitHub API calls always go
 // to the network (the app keeps its last loaded data itself and says how old it is).
-const CACHE = "aife-desk-v1";
+const CACHE = "aife-desk-v2";
 const SHELL = ["./", "index.html", "desk.css", "desk.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", (e) => {

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en-IN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src https://api.github.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0e1116" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Desk">
+<title>AIFE Desk</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="desk.css">
+</head>
+<body>
+<div id="app" class="shell">
+  <aside class="rail" aria-label="Sections">
+    <div class="brand"><span class="mark" aria-hidden="true"></span><span>AIFE Desk</span></div>
+    <nav class="tabs" id="tabs"></nav>
+    <div class="rail-foot" id="rail-foot"></div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-title" id="view-title">Desk</div>
+      <div class="topbar-meta" id="meta"></div>
+      <button class="icon-btn" id="refresh" type="button" aria-label="Refresh">&#x21bb;</button>
+    </header>
+    <div id="banner"></div>
+    <section id="view" class="view" aria-live="polite"></section>
+  </main>
+</div>
+<script src="desk.js"></script>
+</body>
+</html>

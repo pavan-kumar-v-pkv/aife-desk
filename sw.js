@@ -1,6 +1,6 @@
 // Offline shell for AIFE Desk. Caches the app's own files only; GitHub API calls always go
 // to the network (the app keeps its last loaded data itself and says how old it is).
-const CACHE = "aife-desk-v2";
+const CACHE = "aife-desk-v3";
 const SHELL = ["./", "index.html", "desk.css", "desk.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", (e) => {
@@ -17,8 +17,9 @@ self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET" || url.origin !== self.location.origin) return;
   // network first so a new version shows at once; the cache answers when offline
   e.respondWith(fetch(e.request).then((res) => {
+    // a query string can carry a FYERS login code: never store it; keep one copy per path
     const copy = res.clone();
-    caches.open(CACHE).then((c) => c.put(e.request, copy));
+    if (res.ok) caches.open(CACHE).then((c) => c.put(url.origin + url.pathname, copy));
     return res;
-  }).catch(() => caches.match(e.request).then((hit) => hit || caches.match("index.html"))));
+  }).catch(() => caches.match(url.origin + url.pathname).then((hit) => hit || caches.match("index.html"))));
 });

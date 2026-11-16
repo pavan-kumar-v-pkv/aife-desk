@@ -7,10 +7,13 @@
  * workflow, and it records approve/reject decisions on proposals that already
  * passed the risk gate (data/decisions/<signal day>.json). The daily run applies a
  * decision only if it was made before the fill session's 09:15 open.
+ * It is also the FYERS login redirect: it hands the one-time auth code to the Mac
+ * (data/fyers/auth.json), which exchanges it with the app secret that stays there.
  */
 
-const APP_VERSION = "desk-app-v2";
+const APP_VERSION = "desk-app-v3";
 const DECISIONS_VERSION = "desk-decisions-v1";
+const FYERS_HANDOFF = { path: "data/fyers/auth.json", version: "fyers-auth-v1" };
 const IST_OFFSET_MIN = 330;
 const DEFAULT_REPO = "pavan-kumar-v-pkv/ai-investment-trading-engine";
 const STATE_BRANCH = "paper-state";
@@ -26,7 +29,7 @@ const saved = {
 
 const ui = { tab: saved.get(KEYS.tab) || "desk", snap: null, loading: false, error: null,
              sort: { key: "value", dir: -1 }, orderFilter: "planned", runMessage: null,
-             stock: null, confirm: null, saving: null, decisionMessage: null };
+             stock: null, confirm: null, saving: null, decisionMessage: null, fyers: null };
 
 /* ---------- formatting ---------- */
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -733,13 +736,13 @@ function render() {
   if (!connected) {
     $("view-title").textContent = "AIFE Desk";
     $("meta").textContent = "";
-    $("banner").innerHTML = "";
+    $("banner").innerHTML = fyersBanner();
     $("view").innerHTML = viewSetup(ui.error || "");
     return;
   }
   $("view-title").textContent = TABS.find(([k]) => k === ui.tab)?.[1] || "Desk";
   $("meta").textContent = snap ? `Session ${dayShort(snap.summary.signal_day)} · updated ${ago(snap.loadedAt)}` : "";
-  $("banner").innerHTML = ui.error ? `<div class="alert ${snap ? "warn" : "bad"}">${esc(ui.error)}${snap ? ` Showing data from ${esc(new Date(snap.loadedAt).toLocaleString("en-IN"))}.` : ""}</div>` : "";
+  $("banner").innerHTML = fyersBanner() + (ui.error ? `<div class="alert ${snap ? "warn" : "bad"}">${esc(ui.error)}${snap ? ` Showing data from ${esc(new Date(snap.loadedAt).toLocaleString("en-IN"))}.` : ""}</div>` : "");
   $("view").innerHTML = snap ? VIEWS[ui.tab](snap) : `<div class="panel"><div class="empty">${ui.loading ? "Loading the account from GitHub…" : "Nothing loaded yet."}</div></div>`;
   const hadSheet = !!$("sheet").innerHTML;
   $("sheet").innerHTML = snap && ui.stock ? stockSheet(snap, ui.stock) : "";
@@ -777,6 +780,39 @@ async function connect(form) {
   } catch (err) {
     ui.error = explain(err, "Connecting"); render();
   }
+}
+
+/* FYERS sends the browser here after a login with ?s=ok&auth_code=...; pass the code to the Mac. */
+function fyersBanner() {
+  return ui.fyers ? `<div class="alert ${ui.fyers.kind}"><div>${esc(ui.fyers.text)}</div></div>` : "";
+}
+async function handFyersLogin() {
+  const query = new URLSearchParams(location.search);
+  const code = query.get("auth_code");
+  if (!code && !query.has("s")) return;
+  history.replaceState(null, "", location.pathname);   // keep the code out of history and bookmarks
+  if (!code || (query.has("s") && query.get("s") !== "ok")) {
+    ui.fyers = { kind: "bad", text: `FYERS did not approve the login${query.get("message") ? ` (${query.get("message")})` : ""}. Tap the notification to try again.` };
+    render(); return;
+  }
+  const token = saved.get(KEYS.token);
+  if (!token) {
+    ui.fyers = { kind: "bad", text: "FYERS approved the login, but this device isn't connected to GitHub, so it can't reach the Mac. Connect below, then log in again." };
+    render(); return;
+  }
+  ui.fyers = { kind: "info", text: "Sending the FYERS login to the Mac…" }; render();
+  const gh = new GitHub(saved.get(KEYS.repo) || DEFAULT_REPO, token);
+  const doc = { version: FYERS_HANDOFF.version, auth_code: code, received_at: nowIstIso() };
+  try {
+    const current = await gh.fileWithSha(FYERS_HANDOFF.path);
+    await gh.putFile(FYERS_HANDOFF.path, JSON.stringify(doc) + "\n", current?.sha, "desk: FYERS login approved");
+    ui.fyers = { kind: "info", text: "Login sent. If the Mac's quote recorder is waiting, it finishes the login within a minute and starts recording. The Mac accepts it for 10 minutes." };
+  } catch (err) {
+    ui.fyers = { kind: "bad", text: err instanceof GitHubError && (err.status === 403 || err.status === 404)
+      ? "The token can't save the login. On GitHub, edit the token and set Contents to Read and write, then log in again."
+      : explain(err, "Sending the login") };
+  }
+  render();
 }
 
 async function startRun() {
@@ -833,6 +869,7 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", r
   try { ui.snap = JSON.parse(saved.get(KEYS.snapshot) || "null"); } catch { ui.snap = null; }
   if (!VIEWS[ui.tab]) ui.tab = "desk";
   render();
+  handFyersLogin();
   refresh();
   if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
     navigator.serviceWorker.register("sw.js").catch(() => { /* the app works without offline caching */ });
